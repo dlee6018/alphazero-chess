@@ -182,7 +182,7 @@ class MCTS:
         self.move_indexer = AlphaZeroMoveIndexer()
 
     def search(self, root_board: chess.Board) -> Tuple[Optional[chess.Move], Dict[chess.Move, float]]:
-        root = MCTSNode(root_board.copy(stack=False))
+        root = MCTSNode(root_board.copy(stack=False)) # create new copy
 
         # Batched evaluation: collect leaves and evaluate in batches
         pending_leaves = []  # List of (leaf, path) tuples for non-terminal nodes
@@ -190,13 +190,11 @@ class MCTS:
         for sim in range(self.n_simulations):
             leaf, path = self._select(root)
             
-            # Check if terminal - handle immediately
             if leaf.board.is_game_over():
                 value = self._get_terminal_value(leaf.board)
                 self._backpropagate(path, value)
                 continue
             
-            # Add to pending batch
             pending_leaves.append((leaf, path))
             
             # Evaluate batch when full or at end of simulations

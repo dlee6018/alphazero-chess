@@ -1,9 +1,9 @@
-import kagglehub
-from kagglehub import KaggleDatasetAdapter
 import chess
 import numpy as np
+import pandas as pd
+from pathlib import Path
 
-file_path = "games.csv"
+file_path = Path(__file__).parent / "games.csv"
 
 _df = None
 
@@ -18,11 +18,7 @@ def sample_board(batch_size: int = 1):
     """
     global _df
     if _df is None:
-        _df = kagglehub.dataset_load(
-            KaggleDatasetAdapter.PANDAS,
-            "datasnaek/chess",
-            file_path,
-        )
+        _df = pd.read_csv(file_path)
     ex = _df.sample(batch_size)
     
     # Get the first row if batch_size > 1, otherwise just the row
@@ -129,3 +125,8 @@ def board_to_input_planes(board: chess.Board):
 
     # final: shape (18, 8, 8)
     return np.stack(planes)
+
+if __name__ == "__main__":
+    boards, winner = sample_board(batch_size=1)
+    # print(boards)
+    print(winner)
