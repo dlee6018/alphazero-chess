@@ -169,12 +169,15 @@ PolicyValueFn = Callable[[chess.Board], Tuple[Dict[chess.Move, float], float]]
 
 
 class MCTS:
-    def __init__(self, c_puct: float = 1.5, n_simulations: int = 200, batch_size: int = 32):
+    def __init__(self, c_puct: float = 1.5, n_simulations: int = 300, batch_size: int = 256, model=None):
         self.c_puct = c_puct
         self.n_simulations = n_simulations
         self.batch_size = batch_size
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = AlphaZeroChessNet(channels=64, n_blocks=19, n_moves=4672).to(device)
+        if model is None:
+            self.model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
+        else:
+            self.model = model
         self.device = device
         self.move_indexer = AlphaZeroMoveIndexer()
 

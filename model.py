@@ -9,7 +9,7 @@ class ResidualBlock(nn.Module):
       x -> conv3x3 -> BN -> ReLU -> conv3x3 -> BN -> add(skip) -> ReLU
     Input/Output: (B, C, 8, 8)
     """
-    def __init__(self, channels: int = 64):
+    def __init__(self, channels: int = 256):
         super().__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(channels)
