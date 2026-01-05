@@ -284,7 +284,7 @@ class MCTS:
         batch_tensor = torch.from_numpy(batch_tensor).to(self.device)
         
         # Batch inference
-        policy_logits_batch, value_batch = self.model(batch_tensor)
+        policy_logits_batch, value_batch = self.model(batch_tensor) 
         # policy_logits_batch: (batch_size, 4672)
         # value_batch: (batch_size, 1)
         

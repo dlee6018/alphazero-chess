@@ -12,7 +12,7 @@ import queue
 import time
 
 
-def mcts_worker(result_queue, model_state_dict, device_str, c_puct, n_simulations, batch_size):
+def mcts_worker(result_queue, weight_update_queue, model_state_dict, device_str, c_puct, n_simulations, batch_size):
     """Worker process that continuously generates MCTS data"""
     device = torch.device(device_str)
     model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
@@ -23,6 +23,14 @@ def mcts_worker(result_queue, model_state_dict, device_str, c_puct, n_simulation
     
     while True:  # Continuously work
         try:
+            # Check for weight updates (non-blocking)
+            try:
+                new_state_dict = weight_update_queue.get_nowait()
+                model.load_state_dict(new_state_dict)
+                mcts.model = model  # Update MCTS model reference
+            except queue.Empty:
+                pass
+            
             # Sample board
             boards, winner = sample_board(batch_size=1)
             
@@ -48,7 +56,7 @@ def mcts_worker(result_queue, model_state_dict, device_str, c_puct, n_simulation
 def train_batch(batch_buffer, model, optimizer, device, move_indexer):
     """Train on a batch of MCTS results"""
     if len(batch_buffer) == 0:
-        return
+        return None
     
     # Extract data
     boards, moves, probs_list, winners = zip(*batch_buffer)
@@ -73,6 +81,9 @@ def train_batch(batch_buffer, model, optimizer, device, move_indexer):
                     target[move_idx] = prob
             policy_targets.append(target)
         
+        
+        print("policy_logits", policy_logits)
+        print("policy_targets", policy_targets)
         policy_targets = torch.stack(policy_targets)  # (batch_size, 4672)
         
         # Policy loss: KL divergence (better for probability distributions)
@@ -94,7 +105,12 @@ def train_batch(batch_buffer, model, optimizer, device, move_indexer):
     loss.backward()
     optimizer.step()
     
+    # Update model weights for workers
+    model_state_dict = model.state_dict()
+    
     print(f"Policy loss: {policy_loss.item():.4f}, Value loss: {value_loss.item():.4f}, Total loss: {loss.item():.4f}")
+    
+    return model_state_dict
 
 
 def simple_train_supervised(batch_size: int = 256, num_workers: int = 4):
@@ -107,15 +123,16 @@ def simple_train_supervised(batch_size: int = 256, num_workers: int = 4):
     
     move_indexer = AlphaZeroMoveIndexer()
     
-    # Create shared queue
+    # Create shared queues
     result_queue = Queue(maxsize=1000)
+    weight_update_queue = Queue(maxsize=num_workers * 2)
     
     # Start worker processes
     model_state_dict = model.state_dict()
     workers = []
     for _ in range(num_workers):
         p = Process(target=mcts_worker, 
-                   args=(result_queue, model_state_dict, str(device), 
+                   args=(result_queue, weight_update_queue, model_state_dict, str(device), 
                          1.5, 200, 256))
         p.start()
         workers.append(p)
@@ -132,13 +149,27 @@ def simple_train_supervised(batch_size: int = 256, num_workers: int = 4):
                 
                 # Train when batch ready
                 if len(batch_buffer) >= batch_size:
-                    train_batch(batch_buffer, model, optimizer, device, move_indexer)
+                    updated_state_dict = train_batch(batch_buffer, model, optimizer, device, move_indexer)
+                    if updated_state_dict is not None:
+                        # Send updated weights to all workers
+                        for _ in range(num_workers):
+                            try:
+                                weight_update_queue.put_nowait(updated_state_dict)
+                            except queue.Full:
+                                pass  # Skip if queue full (workers will get next update)
                     batch_buffer = []
                     
             except queue.Empty:
                 # Queue empty - train partial batch if large enough
                 if len(batch_buffer) >= batch_size // 2:
-                    train_batch(batch_buffer, model, optimizer, device, move_indexer)
+                    updated_state_dict = train_batch(batch_buffer, model, optimizer, device, move_indexer)
+                    if updated_state_dict is not None:
+                        # Send updated weights to all workers
+                        for _ in range(num_workers):
+                            try:
+                                weight_update_queue.put_nowait(updated_state_dict)
+                            except queue.Full:
+                                pass  # Skip if queue full (workers will get next update)
                     batch_buffer = []
                     
     except KeyboardInterrupt:
