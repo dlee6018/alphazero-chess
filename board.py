@@ -50,10 +50,10 @@ def sample_board(batch_size: int = 1):
                 continue
     
     # Determine winner: 1 for white, -1 for black, 0 for draw
-    winner_str = row['winner']
-    if winner_str == 'White':
+    winner_str = row['winner'].lower()
+    if winner_str == 'white':
         winner = 1
-    elif winner_str == 'Black':
+    elif winner_str == 'black':
         winner = -1
     else:  # 'draw' or any other status
         winner = 0

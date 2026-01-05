@@ -1,11 +1,10 @@
 import math
 import random
 import chess
-import torch
 import numpy as np
-from model import AlphaZeroChessNet
 from board import board_to_input_planes
 from typing import Dict, Optional, Callable, Tuple, List
+import uuid
 
 class AlphaZeroMoveIndexer:
     def __init__(self):
@@ -169,34 +168,35 @@ PolicyValueFn = Callable[[chess.Board], Tuple[Dict[chess.Move, float], float]]
 
 
 class MCTS:
-    def __init__(self, c_puct: float = 1.5, n_simulations: int = 300, batch_size: int = 256, model=None):
+    def __init__(self, c_puct: float = 1.5, n_simulations: int = 200, batch_size: int = 1,
+                 inference_queue=None, inference_result_queue=None, worker_id: int = 0):
         self.c_puct = c_puct
         self.n_simulations = n_simulations
         self.batch_size = batch_size
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        if model is None:
-            self.model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
-        else:
-            self.model = model
+        device = "cpu"
         self.device = device
         self.move_indexer = AlphaZeroMoveIndexer()
+        self.inference_queue = inference_queue
+        self.response_queue = inference_result_queue  # Now a dedicated Queue per worker
+        self.worker_id = worker_id
+        self.pending_inferences = {}  # request_id -> (pending_leaves, batch_tensor)
 
     def search(self, root_board: chess.Board) -> Tuple[Optional[chess.Move], Dict[chess.Move, float]]:
         root = MCTSNode(root_board.copy(stack=False)) # create new copy
 
         # Batched evaluation: collect leaves and evaluate in batches
         pending_leaves = []  # List of (leaf, path) tuples for non-terminal nodes
-        
+
         for sim in range(self.n_simulations):
             leaf, path = self._select(root)
-            
+
             if leaf.board.is_game_over():
                 value = self._get_terminal_value(leaf.board)
                 self._backpropagate(path, value)
                 continue
-            
+
             pending_leaves.append((leaf, path))
-            
+
             # Evaluate batch when full or at end of simulations
             if len(pending_leaves) >= self.batch_size or sim == self.n_simulations - 1:
                 if pending_leaves:
@@ -266,25 +266,30 @@ class MCTS:
             return 1.0 if board.turn == chess.BLACK else -1.0
         return 0.0
 
-    @torch.no_grad()
     def _batch_evaluate_and_backpropagate(self, pending_leaves: List[Tuple[MCTSNode, List[MCTSNode]]]) -> None:
         """Evaluate a batch of leaves and backpropagate results."""
         if not pending_leaves:
             return
-        
+
         # Prepare batch: convert boards to tensors
         boards = [leaf.board for leaf, _ in pending_leaves]
         board_tensors = []
         for board in boards:
             tensor = board_to_input_planes(board)
             board_tensors.append(tensor)
-        
+
         # Stack into batch: (batch_size, 18, 8, 8)
         batch_tensor = np.stack(board_tensors)
-        batch_tensor = torch.from_numpy(batch_tensor).to(self.device)
-        
-        # Batch inference
-        policy_logits_batch, value_batch = self.model(batch_tensor) 
+
+        # Send inference request with worker_id for routing response
+        request_id = str(uuid.uuid4())
+        self.inference_queue.put((self.worker_id, batch_tensor, request_id))
+
+        # Block on dedicated response queue (no polling), each process has it's unique queue
+        response_request_id, policy_logits_batch, value_batch = self.response_queue.get()
+
+        # Verify we got the right response (should always match with dedicated queues)
+        assert response_request_id == request_id, f"Request ID mismatch: {response_request_id} != {request_id}"
         # policy_logits_batch: (batch_size, 4672)
         # value_batch: (batch_size, 1)
         
@@ -340,30 +345,31 @@ class MCTS:
             node.W += value
             node.Q = node.W / node.N
             value = -value  # flip perspective when moving up one ply
-    @torch.no_grad()
-    def policy_value_fn(self, board: chess.Board) -> Tuple[Dict[chess.Move, float], float]:
-        """
-        Single board evaluation (kept for backward compatibility if needed).
-        Prefer using batched evaluation via _batch_evaluate_and_backpropagate.
-        """
-        board_tensor = board_to_input_planes(board)
-        board_tensor = torch.from_numpy(board_tensor).unsqueeze(0).to(self.device)
-        policy_logits, value = self.model(board_tensor)
+    
+    # @torch.no_grad()
+    # def policy_value_fn(self, board: chess.Board) -> Tuple[Dict[chess.Move, float], float]:
+    #     """
+    #     Single board evaluation (kept for backward compatibility if needed).
+    #     Prefer using batched evaluation via _batch_evaluate_and_backpropagate.
+    #     """
+    #     board_tensor = board_to_input_planes(board)
+    #     board_tensor = torch.from_numpy(board_tensor).unsqueeze(0).to(self.device)
+    #     policy_logits, value = self.model(board_tensor)
         
-        # Remove batch dimension: (1, 4672) -> (4672,)
-        policy_logits = policy_logits.squeeze(0)
+    #     # Remove batch dimension: (1, 4672) -> (4672,)
+    #     policy_logits = policy_logits.squeeze(0)
         
-        legal_moves = list(board.legal_moves)
+    #     legal_moves = list(board.legal_moves)
         
-        # Map each legal move to its logit value
-        legal_moves_dict = {}
-        for move in legal_moves:
-            move_idx = self.move_indexer.encode(move)
-            if move_idx is not None:
-                logit_value = float(policy_logits[move_idx].item())
-                legal_moves_dict[move] = logit_value
+    #     # Map each legal move to its logit value
+    #     legal_moves_dict = {}
+    #     for move in legal_moves:
+    #         move_idx = self.move_indexer.encode(move)
+    #         if move_idx is not None:
+    #             logit_value = float(policy_logits[move_idx].item())
+    #             legal_moves_dict[move] = logit_value
         
-        return (legal_moves_dict, float(value.squeeze().item()))
+    #     return (legal_moves_dict, float(value.squeeze().item()))
 
 
 
