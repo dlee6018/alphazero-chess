@@ -1,83 +1,72 @@
 from board import board_to_input_planes, sample_board
-from mcts import MCTS
+from mcts import MCTS, AlphaZeroMoveIndexer
 from model import AlphaZeroChessNet
 import chess
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.amp import autocast
 import torch.multiprocessing as mp
-from multiprocessing import Pool
+from multiprocessing import Queue, Process
+import queue
+import time
 
 
-def mcts_worker(args):
-    """Worker function that creates MCTS with shared model and runs search"""
-    model_state_dict, board_fen, c_puct, n_simulations, batch_size, device_str = args
-
+def mcts_worker(result_queue, model_state_dict, device_str, c_puct, n_simulations, batch_size):
+    """Worker process that continuously generates MCTS data"""
     device = torch.device(device_str)
     model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
     model.load_state_dict(model_state_dict)
     model.eval()
     
     mcts = MCTS(c_puct=c_puct, n_simulations=n_simulations, batch_size=batch_size, model=model)
-    board = chess.Board(board_fen)
-    return mcts.search(board)
     
-    
-def simple_train_supervised(batch_size: int = 4):
-    batches = []
-    board_objects = []
-    winners = []
-    mcts = MCTS(c_puct=1.5, n_simulations=200)
-    move_indexer = mcts.move_indexer
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = mcts.model.to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-    model.train()
-    
-    # Setup multiprocessing
-    mp.set_start_method('spawn', force=True) # starts fresh python interpreter process
-    model_state_dict = model.state_dict()
-    
-    while True:  # Continue training loop
-        # If batches is empty, sample a new board
-        if len(batches) == 0:
+    while True:  # Continuously work
+        try:
+            # Sample board
             boards, winner = sample_board(batch_size=1)
+            
+            # Process all boards from the game
             for board in boards:
-                batch = board_to_input_planes(board)
-                batches.append(batch)
-                board_objects.append(board)
-                winners.append(winner)
-        
-        # Take up to batch_size items from batches
-        k = min(batch_size, len(batches))
-        curr_batch = batches[:k]
-        curr_boards = board_objects[:k]
-        curr_winners = winners[:k]
-        batches = batches[k:]  # Remove used batches
-        board_objects = board_objects[k:]  # Remove used boards
-        winners = winners[k:]  # Remove used winners
-        
-        curr_batch = np.stack(curr_batch)
-        curr_batch = torch.from_numpy(curr_batch)
-        
-        # Get model predictions
+                # Run MCTS
+                move, probs = mcts.search(board)
+                
+                # Put in queue (blocks if queue full - backpressure)
+                result_queue.put((board, move, probs, winner), timeout=1.0)
+            
+        except queue.Full:
+            # Queue full - wait a bit and retry
+            time.sleep(0.1)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            # Log error and continue
+            print(f"Worker error: {e}")
+            time.sleep(0.1)
+
+
+def train_batch(batch_buffer, model, optimizer, device, move_indexer):
+    """Train on a batch of MCTS results"""
+    if len(batch_buffer) == 0:
+        return
+    
+    # Extract data
+    boards, moves, probs_list, winners = zip(*batch_buffer)
+    
+    # Convert boards to input tensors
+    board_tensors = [board_to_input_planes(board) for board in boards]
+    curr_batch = np.stack(board_tensors)
+    curr_batch = torch.from_numpy(curr_batch).to(device)
+    
+    # Get model predictions
+    with autocast(device_type=device.type):
         policy_logits, value = model(curr_batch)  # (batch_size, 4672), (batch_size, 1)
-        
-        # Get MCTS search results - parallelized
-        if curr_boards:
-            with Pool() as p: # defaults to os.cpu_count()
-                args_list = [(model_state_dict, board.fen(), 1.5, 200, 256, str(device)) 
-                            for board in curr_boards]
-                results = p.map(mcts_worker, args_list)
-                moves, probs = zip(*results) # unpack and then zip to avoid [((move1, prob1),)]
-        else:
-            moves, probs = [], []
         
         # Convert MCTS probability distributions to target tensors
         policy_targets = []
-        for prob_dict in probs:
+        for prob_dict in probs_list:
             # Create target distribution: (4672,) tensor with probabilities
-            target = torch.zeros(4672, dtype=torch.float32)
+            target = torch.zeros(4672, dtype=torch.float32, device=device)
             for move, prob in prob_dict.items():
                 move_idx = move_indexer.encode(move)
                 if move_idx is not None and 0 <= move_idx < 4672:
@@ -94,18 +83,73 @@ def simple_train_supervised(batch_size: int = 4):
         )
         
         # Value loss: use actual game outcome
-        value_targets = torch.tensor(curr_winners, dtype=torch.float32).unsqueeze(1)  # (batch_size, 1)
+        value_targets = torch.tensor(winners, dtype=torch.float32, device=device).unsqueeze(1)  # (batch_size, 1)
         value_loss = F.mse_loss(value, value_targets)
         
         # Combined loss
         loss = policy_loss + value_loss
-        
-        # Backward pass
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        
-        print(f"Policy loss: {policy_loss.item():.4f}, Value loss: {value_loss.item():.4f}, Total loss: {loss.item():.4f}")
-     
+    
+    # Backward pass
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    print(f"Policy loss: {policy_loss.item():.4f}, Value loss: {value_loss.item():.4f}, Total loss: {loss.item():.4f}")
+
+
+def simple_train_supervised(batch_size: int = 256, num_workers: int = 4):
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Create model
+    model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    model.train()
+    
+    move_indexer = AlphaZeroMoveIndexer()
+    
+    # Create shared queue
+    result_queue = Queue(maxsize=1000)
+    
+    # Start worker processes
+    model_state_dict = model.state_dict()
+    workers = []
+    for _ in range(num_workers):
+        p = Process(target=mcts_worker, 
+                   args=(result_queue, model_state_dict, str(device), 
+                         1.5, 200, 256))
+        p.start()
+        workers.append(p)
+    
+    # Main training loop
+    batch_buffer = []
+    
+    try:
+        while True:
+            try:
+                # Get result (non-blocking)
+                board, move, probs, winner = result_queue.get(timeout=0.1)
+                batch_buffer.append((board, move, probs, winner))
+                
+                # Train when batch ready
+                if len(batch_buffer) >= batch_size:
+                    train_batch(batch_buffer, model, optimizer, device, move_indexer)
+                    batch_buffer = []
+                    
+            except queue.Empty:
+                # Queue empty - train partial batch if large enough
+                if len(batch_buffer) >= batch_size // 2:
+                    train_batch(batch_buffer, model, optimizer, device, move_indexer)
+                    batch_buffer = []
+                    
+    except KeyboardInterrupt:
+        # Graceful shutdown
+        print("Shutting down...")
+        for p in workers:
+            p.terminate()
+            p.join()
+        print("Workers terminated")
+
+
 if __name__ == "__main__":
+    mp.set_start_method('spawn', force=True)
     simple_train_supervised()
