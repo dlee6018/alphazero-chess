@@ -9,9 +9,9 @@ import torch.multiprocessing as mp
 from multiprocessing import Queue, Process
 import queue
 import time
+import chess
 
-
-def mcts_worker(worker_id, inference_queue, response_queues, result_queue, c_puct, n_simulations):
+def mcts_worker_sample(worker_id, inference_queue, response_queues, result_queue, c_puct, n_simulations):
     """Worker process that continuously generates MCTS data"""
 
     # Each worker uses its own response queue - no contention!
@@ -44,15 +44,76 @@ def mcts_worker(worker_id, inference_queue, response_queues, result_queue, c_puc
             # Log error and continue
             print(f"Worker error: {e}")
             time.sleep(0.1)
+            
+def mcts_worker(worker_id, inference_queue, response_queues, result_queue, c_puct, n_simulations):
+    """Worker process that continuously generates MCTS data"""
 
+    # Each worker uses its own response queue - no contention!
+    response_queue = response_queues[worker_id]
+    mcts = MCTS(c_puct=c_puct, n_simulations=n_simulations, batch_size=64,
+                inference_queue=inference_queue, inference_result_queue=response_queue, worker_id=worker_id)
+    
+    while True:  
+        try:
+            board = chess.Board()  # Create fresh board for each game
+            game_history = []
+            
+            while not board.is_game_over():
+                move, probs = mcts.search(board)
+                game_history.append((board.copy(), move, probs))  # Store copy of board
+                board.push(move)
+            
+            # Determine winner from final result
+            result = board.result()
+            # Retrieve move list in UCI format
+            # move_list = [m.uci() for (_, m, _) in game_history]
+            # print("result: ", result, len(game_history), "moves:", move_list, flush=True)
+            if result == "1-0":
+                final_winner = 1.0  # White won
+            elif result == "0-1":
+                final_winner = -1.0  # Black won
+            else:
+                final_winner = 0.0  # Draw
+            # print("final_winner: ", final_winner, board.turn, flush=True)
+            # Prepare all positions with correct value from each player's perspective
+            game_data = [
+                (board_pos, move, probs, 
+                 final_winner if board_pos.turn == chess.WHITE else -final_winner)
+                for board_pos, move, probs in game_history
+            ]
+            # Add all positions with non-blocking retry
+            while game_data:
+                remaining = []
+                for item in game_data:
+                    try:
+                        result_queue.put_nowait(item)
+                    except queue.Full:
+                        remaining.append(item)
+                
+                if remaining:
+                    game_data = remaining
+                    time.sleep(0.01)  # Brief pause instead of 1s timeout
+                else:
+                    break
+            
+        except queue.Full:
+            # Queue full - wait a bit and retry
+            time.sleep(0.1)
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            # Log error and continue
+            print(f"Worker error: {e}")
+            time.sleep(0.1)
 
 @torch.no_grad()
-def inference_worker(inference_queue, response_queues, weight_update_queue, model_state_dict, device_str, max_batch_size=512, max_wait_ms=5):
+def inference_worker(inference_queue, response_queues, weight_update_queue, model_state_dict, device_str, max_batch_size=512, max_wait_ms=20):
     """Single GPU worker that batches and processes inference requests for maximum GPU utilization"""
     device = torch.device(device_str)
     model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
     model.load_state_dict(model_state_dict)
     model.eval()
+    # model = torch.compile(model)
 
     while True:
         try:
@@ -96,6 +157,7 @@ def inference_worker(inference_queue, response_queues, weight_update_queue, mode
             mega_batch_tensor = torch.from_numpy(mega_batch).to(device)
 
             # Single GPU inference on the mega-batch
+            # print("inference working running on the mega-batch")
             policy_logits, value = model(mega_batch_tensor)
 
             # Convert to CPU numpy for fast serialization
@@ -120,21 +182,23 @@ def inference_worker(inference_queue, response_queues, weight_update_queue, mode
             traceback.print_exc()
             time.sleep(0.1)
 
+CHECKPOINT_STEPS = 500
 
-def train_batch(batch_buffer, model, optimizer, device, move_indexer):
+def train_batch(batch_buffer, model, optimizer, device, move_indexer, step):
     """Train on a batch of MCTS results"""
     if len(batch_buffer) == 0:
         return None
     
     # Extract data
     boards, _, probs_list, winners = zip(*batch_buffer)
-    
+
     # Convert boards to input tensors
     board_tensors = [board_to_input_planes(board) for board in boards]
     curr_batch = np.stack(board_tensors)
     curr_batch = torch.from_numpy(curr_batch).to(device)
     
     # Get model predictions
+    # print("running training on the curr_batch")
     with autocast(device_type=device.type):
         policy_logits, value = model(curr_batch)  # (batch_size, 4672), (batch_size, 1)
         
@@ -149,9 +213,6 @@ def train_batch(batch_buffer, model, optimizer, device, move_indexer):
                     target[move_idx] = prob
             policy_targets.append(target)
         
-        
-        # print("policy_logits", policy_logits)
-        # print("policy_targets", policy_targets)
         policy_targets = torch.stack(policy_targets)  # (batch_size, 4672)
         
         # Policy loss: KL divergence (better for probability distributions)
@@ -162,8 +223,11 @@ def train_batch(batch_buffer, model, optimizer, device, move_indexer):
         )
         
         # Value loss: use actual game outcome
+        # Cast value to float32 to avoid precision issues with autocast
         value_targets = torch.tensor(winners, dtype=torch.float32, device=device).unsqueeze(1)  # (batch_size, 1)
-        value_loss = F.mse_loss(value, value_targets)
+        value_f32 = value.float()
+
+        value_loss = F.mse_loss(value_f32, value_targets)
         
         # Combined loss
         loss = policy_loss + value_loss
@@ -175,26 +239,36 @@ def train_batch(batch_buffer, model, optimizer, device, move_indexer):
     
     # Update model weights for workers (convert to CPU for multiprocessing)
     model_state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-    
-    print(f"Policy loss: {policy_loss.item():.4f}, Value loss: {value_loss.item():.4f}, Total loss: {loss.item():.4f}")
-    
+
+    print(f"Step {step}: Policy loss: {policy_loss.item():.4f}, Value loss: {value_loss.item():.4f}, Total loss: {loss.item():.4f}", flush=True)
+
+    # Checkpoint model weights every CHECKPOINT_STEPS
+    if step % CHECKPOINT_STEPS == 0:
+        checkpoint_path = f"checkpoint_{step}.pt"
+        torch.save(model.state_dict(), checkpoint_path)
+        print(f"Saved checkpoint to {checkpoint_path}", flush=True)
+
     return model_state_dict
+
+
+    
 
 def simple_train_supervised(batch_size: int = 256, num_workers: int = 4):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Create model
     model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     model.train()
+    # model = torch.compile(model)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     move_indexer = AlphaZeroMoveIndexer()
 
     # Create shared queues
-    result_queue = Queue(maxsize=2000)
+    result_queue = Queue(maxsize=10000)
     weight_update_queue = Queue(maxsize=num_workers * 2)
     inference_weight_update_queue = Queue(maxsize=2)  # Separate queue for inference worker
-    inference_queue = Queue(maxsize=2000)  # Larger queue for batching
+    inference_queue = Queue(maxsize=10000)  # Larger queue for batching
 
     # Create per-worker response queues (FAST - no Manager.dict() overhead!)
     response_queues = [Queue(maxsize=100) for _ in range(num_workers)]
@@ -209,7 +283,7 @@ def simple_train_supervised(batch_size: int = 256, num_workers: int = 4):
     # Start MCTS worker processes (CPU)
     workers = []
     for worker_id in range(num_workers):
-        p = Process(target=mcts_worker,
+        p = Process(target=mcts_worker_sample,
                    args=(worker_id, inference_queue, response_queues, result_queue,
                          1.5, 200))
         p.start()
@@ -217,16 +291,19 @@ def simple_train_supervised(batch_size: int = 256, num_workers: int = 4):
     
     # Main training loop
     batch_buffer = []
-    
+    step = 0
+
     try:
         while True:
             try:
-                
+
                 board, move, probs, winner = result_queue.get(timeout=0.1)
                 batch_buffer.append((board, move, probs, winner))
-                
+
+                # print("batch buffer size: ", len(batch_buffer))
                 if len(batch_buffer) >= batch_size:
-                    updated_state_dict = train_batch(batch_buffer, model, optimizer, device, move_indexer)
+                    step += 1
+                    updated_state_dict = train_batch(batch_buffer, model, optimizer, device, move_indexer, step)
                     if updated_state_dict is not None:
                         # Send updated weights to inference worker
                         try:
@@ -244,7 +321,8 @@ def simple_train_supervised(batch_size: int = 256, num_workers: int = 4):
             except queue.Empty:
                 # Queue empty - train partial batch if large enough
                 if len(batch_buffer) >= batch_size // 2:
-                    updated_state_dict = train_batch(batch_buffer, model, optimizer, device, move_indexer)
+                    step += 1
+                    updated_state_dict = train_batch(batch_buffer, model, optimizer, device, move_indexer, step)
                     if updated_state_dict is not None:
                         # Send updated weights to inference worker
                         try:

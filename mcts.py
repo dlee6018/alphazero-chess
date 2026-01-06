@@ -217,8 +217,13 @@ class MCTS:
             return move, {}
 
         move_probs = {m: n / total_visits for m, n in move_visits.items()}
-        best_move = max(move_visits.items(), key=lambda kv: kv[1])[0]
-        return best_move, move_probs
+        
+        # Sample move based on probability distribution instead of always picking the best
+        moves = list(move_probs.keys())
+        probs = list(move_probs.values())
+        sampled_move = random.choices(moves, weights=probs, k=1)[0]
+        
+        return sampled_move, move_probs
 
     def _select(self, root: MCTSNode) -> Tuple[MCTSNode, List[MCTSNode]]:
         node = root
@@ -284,10 +289,11 @@ class MCTS:
         # Send inference request with worker_id for routing response
         request_id = str(uuid.uuid4())
         self.inference_queue.put((self.worker_id, batch_tensor, request_id))
+        # print("worker going to sleep", self.worker_id)
 
         # Block on dedicated response queue (no polling), each process has it's unique queue
         response_request_id, policy_logits_batch, value_batch = self.response_queue.get()
-
+        # print("worker woke up", self.worker_id)
         # Verify we got the right response (should always match with dedicated queues)
         assert response_request_id == request_id, f"Request ID mismatch: {response_request_id} != {request_id}"
         # policy_logits_batch: (batch_size, 4672)
@@ -334,6 +340,29 @@ class MCTS:
                     uniform = 1.0 / len(legal)
                     for m in legal:
                         leaf.P[m] = uniform
+            
+            # Add Dirichlet noise to root node only (for exploration)
+            if leaf.parent is None:  # This is the root node
+                dirichlet_alpha = 0.3  # Typical value from AlphaZero
+                epsilon = 0.25  # Mixing parameter
+                
+                legal_moves_list = list(leaf.P.keys())
+                num_moves = len(legal_moves_list)
+                
+                if num_moves > 0:
+                    # Sample Dirichlet noise
+                    dirichlet_noise = np.random.dirichlet([dirichlet_alpha] * num_moves)
+                    
+                    # Mix priors with noise
+                    for i, move in enumerate(legal_moves_list):
+                        leaf.P[move] = (1 - epsilon) * leaf.P[move] + epsilon * dirichlet_noise[i]
+                    
+                    # Renormalize after adding noise
+                    s = sum(leaf.P.values())
+                    if s > 0.0:
+                        inv = 1.0 / s
+                        for m in leaf.P:
+                            leaf.P[m] *= inv
             
             # Backpropagate
             self._backpropagate(path, value)
