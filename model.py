@@ -5,8 +5,6 @@ import torch.nn.functional as F
 
 class ResidualBlock(nn.Module):
     """
-    Standard ResNet block (AlphaZero-style):
-      x -> conv3x3 -> BN -> ReLU -> conv3x3 -> BN -> add(skip) -> ReLU
     Input/Output: (B, C, 8, 8)
     """
     def __init__(self, channels: int = 256):
@@ -34,7 +32,7 @@ class ResidualBlock(nn.Module):
 
 class ConvBlock(nn.Module):
     """
-    Initial stem: (B, 18, 8, 8) -> (B, C, 8, 8)
+    (B, 18, 8, 8) -> (B, C, 8, 8)
     """
     def __init__(self, in_channels: int = 18, channels: int = 64):
         super().__init__()
@@ -51,9 +49,7 @@ class ConvBlock(nn.Module):
 
 class PolicyHead(nn.Module):
     """
-    Policy head (simple flat move head):
-      (B, C, 8, 8) -> conv1x1 to 2 channels -> BN -> ReLU -> flatten -> Linear -> logits
-    Output: (B, n_moves) logits (mask illegal moves outside)
+    (B, C, 8, 8) -> (B, n_moves)
     """
     def __init__(self, channels: int = 64, n_moves: int = 4672):
         super().__init__()
@@ -66,16 +62,15 @@ class PolicyHead(nn.Module):
         x = self.conv(x)
         x = self.bn(x)
         x = self.relu(x)
-        x = x.view(x.size(0), -1)  # (B, 128)
+        x = x.view(x.size(0), -1)  # (B, channels)
         logits = self.fc(x)        # (B, n_moves)
         return logits
 
 
 class ValueHead(nn.Module):
     """
-    Value head:
-      (B, C, 8, 8) -> conv1x1 to 1 channel -> BN -> ReLU -> flatten -> FC -> ReLU -> FC -> tanh
-    Output: (B, 1) in [-1, 1]
+    (B, C, 8, 8) -> (B, 3) logits for [loss, draw, win] classes
+    Class 0 = loss (-1), Class 1 = draw (0), Class 2 = win (+1)
     """
     def __init__(self, channels: int = 64, hidden: int = 256):
         super().__init__()
@@ -83,8 +78,7 @@ class ValueHead(nn.Module):
         self.bn = nn.BatchNorm2d(1)
         self.relu = nn.ReLU(inplace=True)
         self.fc1 = nn.Linear(1 * 8 * 8, hidden)
-        self.fc2 = nn.Linear(hidden, 1)
-        self.tanh = nn.Tanh()
+        self.fc2 = nn.Linear(hidden, 3)  # 3 classes: loss, draw, win
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
@@ -93,17 +87,21 @@ class ValueHead(nn.Module):
         x = x.view(x.size(0), -1)  # (B, 64)
         x = self.fc1(x)            # (B, hidden)
         x = self.relu(x)
-        x = self.fc2(x)            # (B, 1)
-        v = self.tanh(x)           # (B, 1) in [-1, 1]
-        return v
+        logits = self.fc2(x)       # (B, 3) raw logits
+        return logits
+
+    def logits_to_expected_value(self, logits: torch.Tensor) -> torch.Tensor:
+        """Convert 3-class logits to expected value in [-1, 1] for MCTS"""
+        probs = F.softmax(logits, dim=1)  # (B, 3)
+        # Expected value: P(win)*1 + P(draw)*0 + P(loss)*(-1) = P(win) - P(loss)
+        return (probs[:, 2] - probs[:, 0]).unsqueeze(1)  # (B, 1)
 
 
 class AlphaZeroChessNet(nn.Module):
     """
     Full model:
       Input:  (B, 18, 8, 8)
-      Trunk:  ConvBlock -> N residual blocks, all at 'channels'
-      Heads:  policy logits (B, n_moves), value (B, 1)
+      Output:  policy logits - (B, n_moves), value - (B, 1)
     """
     def __init__(self, channels: int = 64, n_blocks: int = 19, n_moves: int = 4672, value_hidden: int = 256):
         super().__init__()
@@ -124,8 +122,7 @@ class AlphaZeroChessNet(nn.Module):
 
 
 if __name__ == "__main__":
-    # Quick sanity check
-    model = AlphaZeroChessNet(channels=64, n_blocks=19, n_moves=4672)
+    model = AlphaZeroChessNet(channels=128, n_blocks=19, n_moves=4672)
     dummy = torch.randn(4, 18, 8, 8)
     p, v = model(dummy)
     print("policy:", p)  # (4, 4672),(Batch, total_moves_possible)
