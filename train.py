@@ -81,7 +81,7 @@ def mcts_worker_self_play(worker_id, inference_queue, response_queues, result_qu
                 # First 30 plies (~15 moves): temperature=1.0 for diverse openings
                 # After that: temperature=0.1 for near-deterministic play
                 if move_count < 30:
-                    temperature = 1.0
+                    temperature = 1.5
                 else:
                     temperature = 0.1
 
@@ -129,7 +129,7 @@ def mcts_worker_self_play(worker_id, inference_queue, response_queues, result_qu
 def inference_worker(inference_queue, response_queues, weight_update_queue, model_state_dict, device_str, max_batch_size=512, max_wait_ms=20):
     """Single GPU worker that batches and processes inference requests for maximum GPU utilization"""
     device = torch.device(device_str)
-    model = AlphaZeroChessNet(channels=128, n_blocks=20, n_moves=4672).to(device)
+    model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
     model.load_state_dict(model_state_dict)
     model.eval()
 
@@ -233,15 +233,24 @@ def train_batch(batch_buffer, model, optimizer, device, move_indexer, step):
             reduction='batchmean'
         )
 
-        # Value loss: Cross-entropy with 3 classes (loss, draw, win)
-        # Convert winner values (-1, 0, 1) to class indices (0, 1, 2)
-        winners_tensor = torch.tensor(winners, dtype=torch.float32, device=device)
-        value_class_targets = (winners_tensor + 1).long()  # -1->0, 0->1, 1->2
+        # Value loss: Soft cross-entropy with smoothed targets (anti-collapse)
+        # Instead of one-hot, use soft targets to keep gradients alive:
+        #   Win  → [0.05, 0.10, 0.85]
+        #   Draw → [0.15, 0.70, 0.15]
+        #   Loss → [0.85, 0.10, 0.05]
+        soft_targets_map = {
+            1.0:  torch.tensor([0.05, 0.10, 0.85], device=device),  # Win
+            0.0:  torch.tensor([0.15, 0.70, 0.15], device=device),  # Draw
+            -1.0: torch.tensor([0.85, 0.10, 0.05], device=device),  # Loss
+        }
+        value_soft_targets = torch.stack([soft_targets_map[w] for w in winners])  # (B, 3)
 
-        # Class weights: weight decisive games (win/loss) higher than draws
-        # This prevents the model from always predicting "draw"
-        class_weights = torch.tensor([3.0, 1.0, 3.0], device=device)  # [loss, draw, win]
-        value_loss = F.cross_entropy(value_logits.float(), value_class_targets, weight=class_weights)
+        # Soft cross-entropy: -sum(target * log_softmax(logits))
+        # With sample weighting: decisive games weighted 3x higher
+        log_probs = F.log_softmax(value_logits.float(), dim=1)
+        sample_weights = torch.tensor([3.0 if w != 0.0 else 1.0 for w in winners], device=device)
+        value_loss = -(value_soft_targets * log_probs).sum(dim=1)  # (B,)
+        value_loss = (value_loss * sample_weights).mean() / sample_weights.mean()  # Weighted mean
 
         # Combined loss
         loss = policy_loss + value_loss
@@ -270,12 +279,10 @@ def train_batch(batch_buffer, model, optimizer, device, move_indexer, step):
     return model_state_dict
 
 
-    
-
 def simple_train_supervised(batch_size: int = 256, num_workers: int = 4, checkpoint_path: str = "checkpoint_8000.pt"):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = AlphaZeroChessNet(channels=128, n_blocks=20, n_moves=4672).to(device)
+    model = AlphaZeroChessNet(channels=256, n_blocks=20, n_moves=4672).to(device)
     model.train()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
@@ -364,4 +371,4 @@ def simple_train_supervised(batch_size: int = 256, num_workers: int = 4, checkpo
 
 if __name__ == "__main__":
     mp.set_start_method('spawn', force=True)
-    simple_train_supervised(num_workers=20) # 20 workers for self play
+    simple_train_supervised(num_workers=8) # 20 workers for self play

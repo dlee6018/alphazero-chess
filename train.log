@@ -1,0 +1,13 @@
+Step 1: Policy loss: 7.5716, Value loss: 1.1101, Total loss: 8.6817 | Value preds: L=29.4% D=33.4% W=37.3%
+Step 2: Policy loss: 7.5050, Value loss: 0.9895, Total loss: 8.4944 | Value preds: L=26.5% D=41.3% W=32.2%
+Step 3: Policy loss: 7.4969, Value loss: 0.8559, Total loss: 8.3529 | Value preds: L=19.0% D=58.5% W=22.5%
+Step 4: Policy loss: 7.3814, Value loss: 0.8406, Total loss: 8.2219 | Value preds: L=17.2% D=62.6% W=20.2%
+Step 5: Policy loss: 7.4365, Value loss: 0.8218, Total loss: 8.2583 | Value preds: L=13.8% D=70.8% W=15.5%
+Step 6: Policy loss: 7.3294, Value loss: 0.8288, Total loss: 8.1582 | Value preds: L=12.4% D=74.1% W=13.5%
+Step 7: Policy loss: 7.3178, Value loss: 0.8328, Total loss: 8.1506 | Value preds: L=11.8% D=76.1% W=12.2%
+Step 8: Policy loss: 7.0711, Value loss: 0.8321, Total loss: 7.9032 | Value preds: L=11.7% D=77.0% W=11.3%
+Step 9: Policy loss: 7.0488, Value loss: 0.8304, Total loss: 7.8792 | Value preds: L=12.3% D=76.5% W=11.1%
+Step 10: Policy loss: 7.0858, Value loss: 0.8270, Total loss: 7.9128 | Value preds: L=13.3% D=75.3% W=11.4%
+Step 11: Policy loss: 7.2002, Value loss: 0.8245, Total loss: 8.0247 | Value preds: L=14.5% D=73.4% W=12.1%
+Step 12: Policy loss: 7.0783, Value loss: 0.8215, Total loss: 7.8998 | Value preds: L=15.5% D=71.9% W=12.6%
+Step 13: Policy loss: 7.0404, Value loss: 0.8206, Total loss: 7.8611 | Value preds: L=16.5% D=70.2% W=13.3%
