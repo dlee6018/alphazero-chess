@@ -9,4 +9,9 @@ dependencies = [
     "kagglehub[pandas-datasets]>=0.3.13",
     "torch>=2.9.1",
     "flask>=3.0.0",
+    "tensorboard>=2.20.0",
+    "torch-tb-profiler>=0.4.3",
+    "wandb>=0.17",
+    "torchvision>=0.24.1",
+    "stockfish>=5.2.0",
 ]
